@@ -11,11 +11,11 @@ SERVICE_KEY = os.getenv("G2B_API_KEY", "").strip()
 if "%" in SERVICE_KEY:
     SERVICE_KEY = urllib.parse.unquote(SERVICE_KEY)
 
-# 2. 키워드 및 카테고리 정의
+# 2. 핵심 관심 키워드
 CATEGORY_RULES = {
-    "AI": ["AI", "인공지능", "LLM", "딥러닝", "머신러닝", "비전", "알고리즘", "지능형", "데이터", "빅데이터"],
-    "소부장": ["소부장", "소재", "부품", "장비", "스마트", "공정", "반도체", "센서", "배터리", "이차전지", "제조", "로봇", "자동화", "설계", "검사", "카메라"],
-    "용역": ["용역", "연구", "개발", "R&D", "구축", "플랫폼", "시스템", "SW", "소프트웨어", "실증", "ISP"]
+    "AI": ["AI", "인공지능", "LLM", "딥러닝", "머신러닝", "비전", "알고리즘", "지능형", "데이터"],
+    "소부장": ["소부장", "소재", "부품", "장비", "스마트", "공정", "반도체", "센서", "배터리", "이차전지", "제조", "로봇", "자동화", "설계", "검사"],
+    "용역": ["용역", "연구", "개발", "R&D", "구축", "플랫폼", "시스템", "SW", "소프트웨어", "실증"]
 }
 
 ALL_KEYWORDS = [kw for kws in CATEGORY_RULES.values() for kw in kws]
@@ -42,29 +42,16 @@ def calculate_dday(close_dt_str):
         pass
     return "진행중", "dday-safe"
 
-def get_robust_session():
-    """네트워크 타임아웃 및 일시적 단절에 대비한 재시도 세션 생성"""
-    session = requests.Session()
-    retry_strategy = Retry(
-        total=4,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"]
-    )
-    adapter = HTTPAdapter(max_retries=retry_strategy)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-    return session
-
 def fetch_real_bids():
     today = datetime.today()
-    start_date = (today - timedelta(days=14)).strftime("%Y%m%d0000")
+    # 통신 지연을 방지하기 위해 최근 5일 데이터로 슬림화
+    start_date = (today - timedelta(days=5)).strftime("%Y%m%d0000")
     end_date = today.strftime("%Y%m%d2359")
     
     url = "https://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoServcPPSSrch01"
     params = {
         "serviceKey": SERVICE_KEY,
-        "numOfRows": "100", # 응답 지연 방지를 위해 안정적인 100건으로 조정
+        "numOfRows": "60", # 타임아웃 방지를 위해 가볍게 요청
         "pageNo": "1",
         "inqryDiv": "1",
         "inqryBgnDt": start_date,
@@ -72,18 +59,25 @@ def fetch_real_bids():
         "type": "json"
     }
     
+    # 해외 가상서버 차단 방지를 위한 브라우저 헤더
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
+    
     items = []
     if not SERVICE_KEY:
-        return items, "G2B_API_KEY 시크릿이 설정되지 않았습니다."
+        return items, "G2B_API_KEY 시크릿이 등록되지 않았습니다."
 
-    session = get_robust_session()
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retries))
 
     try:
-        # 연결 타임아웃(30초), 읽기 타임아웃(60초) 설정
-        res = session.get(url, params=params, timeout=(30, 60))
+        res = session.get(url, params=params, headers=headers, timeout=(15, 30))
         
         if res.text.strip().startswith("<"):
-            return items, "공공데이터포털 인증키 승인 연계 중이거나 권한 에러입니다."
+            return items, "공공데이터포털 인증키 승인 연계 중입니다. (신청 후 1~2시간 소요)"
 
         data = res.json()
         raw_items = data.get("response", {}).get("body", {}).get("items", [])
@@ -99,7 +93,7 @@ def fetch_real_bids():
                 bid_no = item.get("bidNtceNo", "")
                 bid_ord = item.get("bidNtceOrd", "00")
                 
-                # 공고 상세 직통 링크
+                # 공고 상세페이지 직통 링크
                 if bid_no:
                     direct_url = f"https://www.g2b.go.kr:8081/ep/invitation/publish/bidInfoDtl.do?bidno={bid_no}&bidseq={bid_ord}&releaseYn=Y&taskClCd=5"
                 else:
@@ -133,11 +127,11 @@ def fetch_real_bids():
                 })
         return items, ""
     except Exception as e:
-        return items, f"서버 통신 지연(재시도 실패): {e}"
+        return items, f"공공데이터 서버 통신 오류: {e}"
 
 def update_html():
     bids, err_msg = fetch_real_bids()
-    print(f"수집 성공: {len(bids)}건")
+    print(f"최종 수집된 공고: {len(bids)}건")
 
     with open("index.html", "r", encoding="utf-8") as f:
         html = f.read()
@@ -147,7 +141,7 @@ def update_html():
     week_str = f"{now.year}년 {now.month}월 {(now.day - 1) // 7 + 1}주차"
 
     html = re.sub(r'id="metaWeek">.*?</div>', f'id="metaWeek"><strong>기준 주차:</strong> {week_str}</div>', html)
-    html = re.sub(r'id="metaSync">.*?</div>', f'id="metaSync"><strong>최근 동기화:</strong> {now_str} (실시간 동기화)</div>', html)
+    html = re.sub(r'id="metaSync">.*?</div>', f'id="metaSync"><strong>최근 동기화:</strong> {now_str} (실시간 갱신)</div>', html)
 
     total_cnt = len(bids)
     urgent_cnt = sum(1 for b in bids if "urgent" in b["dday_class"])
@@ -181,7 +175,7 @@ def update_html():
           </td>
         </tr>"""
     else:
-        msg = err_msg if err_msg else "최근 14일간 관심 키워드에 해당하는 신규 공고가 없습니다."
+        msg = err_msg if err_msg else "최근 5일간 조건에 부합하는 신규 공고가 없습니다."
         rows_html = f"""
         <tr>
           <td colspan="5" style="text-align:center; padding: 40px; color: #ef4444; font-weight:600;">
@@ -193,7 +187,7 @@ def update_html():
 
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print("동기화 완료!")
+    print("HTML 업데이트 완료!")
 
 if __name__ == "__main__":
     update_html()
