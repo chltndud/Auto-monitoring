@@ -4,11 +4,12 @@ import urllib.parse
 from datetime import datetime, timedelta
 import re
 
+# 1. API 키 처리
 SERVICE_KEY = os.getenv("G2B_API_KEY", "").strip()
 if "%" in SERVICE_KEY:
     SERVICE_KEY = urllib.parse.unquote(SERVICE_KEY)
 
-# 팀 핵심 관심 도메인별 매칭 키워드
+# 2. 팀 핵심 관심 도메인별 매칭 키워드
 CATEGORY_RULES = {
     "AI": ["AI", "인공지능", "LLM", "딥러닝", "머신러닝", "비전", "알고리즘", "지능형", "빅데이터", "플랫폼", "SW", "소프트웨어", "정보화"],
     "소부장": ["소부장", "소재", "부품", "장비", "스마트", "공정", "반도체", "센서", "배터리", "이차전지", "제조", "로봇", "자동화", "설계", "검사", "카메라", "모듈", "기구", "컨베이어", "시제품", "가공"],
@@ -16,7 +17,6 @@ CATEGORY_RULES = {
 }
 
 def classify_target(title):
-    """제목을 분석해 해당하는 팀 카테고리와 매칭 키워드를 반환"""
     matched_tags = []
     found_cat = None
     
@@ -47,14 +47,15 @@ def calculate_dday(close_dt_str):
         pass
     return "진행중", "dday-safe"
 
-def fetch_bids_from_endpoint(url, start_date, end_date):
+def fetch_bids_period(url, start_dt, end_dt):
+    """지정된 기간(최대 10일 단위) 동안의 공고를 수집하는 함수"""
     params = {
         "serviceKey": SERVICE_KEY,
-        "numOfRows": "100",
+        "numOfRows": "50",
         "pageNo": "1",
         "inqryDiv": "1",
-        "inqryBgnDt": start_date,
-        "inqryEndDt": end_date,
+        "inqryBgnDt": start_dt,
+        "inqryEndDt": end_dt,
         "type": "json"
     }
     headers = {
@@ -63,7 +64,7 @@ def fetch_bids_from_endpoint(url, start_date, end_date):
     }
     
     try:
-        res = requests.get(url, params=params, headers=headers, timeout=25)
+        res = requests.get(url, params=params, headers=headers, timeout=20)
         if res.text.strip().startswith("<"):
             return []
         data = res.json()
@@ -72,45 +73,49 @@ def fetch_bids_from_endpoint(url, start_date, end_date):
             return [items]
         return items or []
     except Exception as e:
-        print(f"API 요청 실패: {e}")
+        print(f"기간 {start_dt}~{end_dt} 요청 실패: {e}")
         return []
 
 def fetch_real_bids():
-    today = datetime.today()
-    # 최근 60일치로 대폭 확대
-    start_date = (today - timedelta(days=60)).strftime("%Y%m%d0000")
-    end_date = today.strftime("%Y%m%d2359")
-    
     if not SERVICE_KEY:
         return [], "G2B_API_KEY 시크릿이 설정되지 않았습니다."
 
     servc_url = "https://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoServcPPSSrch01"
     thng_url = "https://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoThngPPSSrch01"
 
-    raw_items = fetch_bids_from_endpoint(servc_url, start_date, end_date)
-    raw_items += fetch_bids_from_endpoint(thng_url, start_date, end_date)
+    all_raw_items = []
+    today = datetime.today()
+
+    # 조달청 1개월 제약을 피하기 위해 최근 30일을 7일씩 쪼개어 4회 호출
+    for i in range(4):
+        chunk_end = today - timedelta(days=i * 7)
+        chunk_start = today - timedelta(days=(i + 1) * 7)
+        
+        start_str = chunk_start.strftime("%Y%m%d0000")
+        end_str = chunk_end.strftime("%Y%m%d2359")
+        
+        all_raw_items += fetch_bids_period(servc_url, start_str, end_str)
+        all_raw_items += fetch_bids_period(thng_url, start_str, end_str)
 
     items = []
     seen_ids = set()
 
-    for item in raw_items:
+    for item in all_raw_items:
         bid_name = item.get("bidNtceNm", "")
         bid_no = item.get("bidNtceNo", "")
         bid_ord = item.get("bidNtceOrd", "00")
         
+        if not bid_name or not bid_no:
+            continue
+
         unique_id = f"{bid_no}-{bid_ord}"
         if unique_id in seen_ids:
             continue
         seen_ids.add(unique_id)
 
-        # 팀 타깃 카테고리 매칭 판별
         category, matched_kws = classify_target(bid_name)
         
-        # 상세 직통 링크 생성
-        if bid_no:
-            direct_url = f"https://www.g2b.go.kr:8081/ep/invitation/publish/bidInfoDtl.do?bidno={bid_no}&bidseq={bid_ord}&releaseYn=Y&taskClCd=5"
-        else:
-            direct_url = item.get("bidNtceDtlUrl") or "https://www.g2b.go.kr"
+        direct_url = f"https://www.g2b.go.kr:8081/ep/invitation/publish/bidInfoDtl.do?bidno={bid_no}&bidseq={bid_ord}&releaseYn=Y&taskClCd=5"
 
         try:
             price_val = float(item.get("presmptPrce", 0) or item.get("bdgtAmt", 0) or 0)
@@ -131,7 +136,6 @@ def fetch_real_bids():
         else:
             tags_str = "#일반입찰 #조달공고"
 
-        # 뱃지 CSS 클래스 지정
         if category == "AI": cat_class = "cat-rd"
         elif category == "소부장": cat_class = "cat-cons"
         elif category == "용역": cat_class = "cat-bid"
@@ -166,7 +170,6 @@ def update_html():
     html = re.sub(r'id="metaWeek">.*?</div>', f'id="metaWeek"><strong>기준 주차:</strong> {week_str}</div>', html)
     html = re.sub(r'id="metaSync">.*?</div>', f'id="metaSync"><strong>최근 동기화:</strong> {now_str} (실시간 갱신)</div>', html)
 
-    # 4대 카드 수치 산정
     total_cnt = len(bids)
     urgent_cnt = sum(1 for b in bids if "urgent" in b["dday_class"])
     team_target_cnt = sum(1 for b in bids if b["category"] in ["AI", "소부장", "용역"])
@@ -174,7 +177,7 @@ def update_html():
     html = re.sub(r'id="statTotal">.*?<span', f'id="statTotal">{total_cnt} <span', html)
     html = re.sub(r'id="statUrgent">.*?<span', f'id="statUrgent">{urgent_cnt} <span', html)
     html = re.sub(r'id="statAi">.*?<span', f'id="statAi">{team_target_cnt} <span', html)
-    html = re.sub(r'id="statBudget">.*?<span', f'id="statBudget">{max(total_cnt * 1.8, 0):.1f} 억원 <span', html)
+    html = re.sub(r'id="statBudget">.*?<span', f'id="statBudget">{max(total_cnt * 1.5, 0):.1f} 억원 <span', html)
 
     if bids:
         rows_html = ""
@@ -199,7 +202,7 @@ def update_html():
           </td>
         </tr>"""
     else:
-        msg = err_msg if err_msg else "최근 60일간 수집된 공고가 없습니다."
+        msg = err_msg if err_msg else "수집된 공고가 없습니다."
         rows_html = f"""
         <tr>
           <td colspan="5" style="text-align:center; padding: 40px; color: #ef4444; font-weight:600;">
