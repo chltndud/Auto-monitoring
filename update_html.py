@@ -1,35 +1,35 @@
 import os
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 import urllib.parse
 from datetime import datetime, timedelta
 import re
 
-# 1. API 키 불러오기 및 디코딩 처리
-def clean_key(env_name):
-    key = os.getenv(env_name, "").strip()
-    return urllib.parse.unquote(key) if "%" in key else key
+SERVICE_KEY = os.getenv("G2B_API_KEY", "").strip()
+if "%" in SERVICE_KEY:
+    SERVICE_KEY = urllib.parse.unquote(SERVICE_KEY)
 
-G2B_KEY = clean_key("G2B_API_KEY")
-IRIS_KEY = clean_key("IRIS_API_KEY")
-SB_KEY = clean_key("SB_API_KEY")
-NB_KEY = clean_key("NB_API_KEY")
-
-# 2. 도메인 분류 규칙
+# 팀 핵심 관심 도메인별 매칭 키워드
 CATEGORY_RULES = {
-    "AI": ["AI", "인공지능", "LLM", "딥러닝", "머신러닝", "비전", "알고리즘", "지능형", "데이터", "빅데이터"],
-    "소부장": ["소부장", "소재", "부품", "장비", "스마트", "공정", "반도체", "센서", "배터리", "이차전지", "제조", "로봇", "자동화", "설계", "검사", "예지보전"],
-    "용역": ["용역", "연구", "개발", "R&D", "구축", "플랫폼", "시스템", "SW", "소프트웨어", "실증", "ISP"]
+    "AI": ["AI", "인공지능", "LLM", "딥러닝", "머신러닝", "비전", "알고리즘", "지능형", "빅데이터", "플랫폼", "SW", "소프트웨어", "정보화"],
+    "소부장": ["소부장", "소재", "부품", "장비", "스마트", "공정", "반도체", "센서", "배터리", "이차전지", "제조", "로봇", "자동화", "설계", "검사", "카메라", "모듈", "기구", "컨베이어", "시제품", "가공"],
+    "용역": ["연구", "개발", "R&D", "구축", "실증", "기획", "표준화", "시험", "ISP", "전략"]
 }
 
-ALL_KEYWORDS = [kw for kws in CATEGORY_RULES.values() for kw in kws]
-
-def classify_category(title):
+def classify_target(title):
+    """제목을 분석해 해당하는 팀 카테고리와 매칭 키워드를 반환"""
+    matched_tags = []
+    found_cat = None
+    
     for cat, kws in CATEGORY_RULES.items():
-        if any(k.lower() in title.lower() for k in kws):
-            return cat
-    return "용역"
+        kws_matched = [k for k in kws if k.lower() in title.lower()]
+        if kws_matched:
+            if not found_cat:
+                found_cat = cat
+            matched_tags.extend(kws_matched)
+            
+    if found_cat:
+        return found_cat, list(set(matched_tags))
+    return "일반입찰", []
 
 def calculate_dday(close_dt_str):
     try:
@@ -47,153 +47,114 @@ def calculate_dday(close_dt_str):
         pass
     return "진행중", "dday-safe"
 
-def get_session():
-    session = requests.Session()
-    retries = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    session.mount("http://", HTTPAdapter(max_retries=retries))
-    return session
-
-# --- 1. 나라장터 공고 수집 ---
-def fetch_g2b():
-    if not G2B_KEY: return []
-    today = datetime.today()
-    start_date = (today - timedelta(days=7)).strftime("%Y%m%d0000")
-    end_date = today.strftime("%Y%m%d2359")
-    
-    url = "https://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoServcPPSSrch01"
+def fetch_bids_from_endpoint(url, start_date, end_date):
     params = {
-        "serviceKey": G2B_KEY,
-        "numOfRows": "80",
+        "serviceKey": SERVICE_KEY,
+        "numOfRows": "100",
         "pageNo": "1",
         "inqryDiv": "1",
         "inqryBgnDt": start_date,
         "inqryEndDt": end_date,
         "type": "json"
     }
-    items = []
-    try:
-        res = get_session().get(url, params=params, timeout=(15, 30))
-        raw_items = res.json().get("response", {}).get("body", {}).get("items", [])
-        if isinstance(raw_items, dict): raw_items = [raw_items]
-
-        for item in raw_items:
-            title = item.get("bidNtceNm", "")
-            matched = [k for k in ALL_KEYWORDS if k.lower() in title.lower()]
-            if matched:
-                category = classify_category(title)
-                bid_no = item.get("bidNtceNo", "")
-                bid_ord = item.get("bidNtceOrd", "00")
-                direct_url = f"https://www.g2b.go.kr:8081/ep/invitation/publish/bidInfoDtl.do?bidno={bid_no}&bidseq={bid_ord}&releaseYn=Y&taskClCd=5" if bid_no else "https://www.g2b.go.kr"
-                
-                try:
-                    price_val = float(item.get("presmptPrce", 0))
-                    budget_str = f"{price_val / 100000000:.1f} 억원" if price_val >= 100000000 else f"{int(price_val / 10000):,} 만원" if price_val > 0 else "규격서 참조"
-                except Exception:
-                    budget_str = "규격서 참조"
-
-                close_dt = item.get("bidClseDt", "-")
-                dday_label, dday_class = calculate_dday(close_dt)
-
-                items.append({
-                    "org": (item.get("dminsttNm") or item.get("orderInsttNm") or "조달청")[:12],
-                    "category": category,
-                    "cat_class": "cat-rd" if category == "AI" else "cat-cons" if category == "소부장" else "cat-bid",
-                    "title": title,
-                    "tags": " ".join([f"#{k}" for k in matched[:4]]),
-                    "budget": budget_str,
-                    "close_date": close_dt,
-                    "dday_text": dday_label,
-                    "dday_class": dday_class,
-                    "url": direct_url
-                })
-    except Exception as e:
-        print(f"G2B 수집 에러: {e}")
-    return items
-
-# --- 2. 과학기술정보통신부 국가연구개발사업 (IRIS 연계) 공고 수집 ---
-def fetch_iris():
-    if not IRIS_KEY: return []
-    url = "https://apis.data.go.kr/1741000/NationalRnDNotice02/getNationalRnDNoticeList02"
-    params = {
-        "serviceKey": IRIS_KEY,
-        "numOfRows": "50",
-        "pageNo": "1",
-        "type": "json"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json"
     }
-    items = []
+    
     try:
-        res = get_session().get(url, params=params, timeout=(15, 30))
-        raw_items = res.json().get("response", {}).get("body", {}).get("items", [])
-        if isinstance(raw_items, dict): raw_items = [raw_items]
-
-        for item in raw_items:
-            title = item.get("pblancNm") or item.get("bsnsNm") or ""
-            matched = [k for k in ALL_KEYWORDS if k.lower() in title.lower()]
-            if matched or not ALL_KEYWORDS:
-                dday_label, dday_class = calculate_dday(item.get("rcptEndDt", "-"))
-                items.append({
-                    "org": (item.get("jrsdMofNm") or item.get("mngInstNm") or "과기정통부")[:12],
-                    "category": "AI" if "AI" in title or "지능" in title else "소부장",
-                    "cat_class": "cat-rd",
-                    "title": f"[국책 R&D] {title}",
-                    "tags": " ".join([f"#{k}" for k in matched[:4]]) if matched else "#국가연구개발 #R&D",
-                    "budget": "과제 공고문 참조",
-                    "close_date": item.get("rcptEndDt", "-"),
-                    "dday_text": dday_label,
-                    "dday_class": dday_class,
-                    "url": item.get("dtlUrl") or "https://www.iris.go.kr"
-                })
+        res = requests.get(url, params=params, headers=headers, timeout=25)
+        if res.text.strip().startswith("<"):
+            return []
+        data = res.json()
+        items = data.get("response", {}).get("body", {}).get("items", [])
+        if isinstance(items, dict):
+            return [items]
+        return items or []
     except Exception as e:
-        print(f"IRIS 수집 에러: {e}")
-    return items
+        print(f"API 요청 실패: {e}")
+        return []
 
-# --- 3. 한국남부발전 / 한국서부발전 입찰공고 수집 ---
-def fetch_power_bids(api_key, org_name, base_url):
-    if not api_key: return []
-    params = {
-        "serviceKey": api_key,
-        "numOfRows": "50",
-        "pageNo": "1",
-        "type": "json"
-    }
+def fetch_real_bids():
+    today = datetime.today()
+    # 최근 60일치로 대폭 확대
+    start_date = (today - timedelta(days=60)).strftime("%Y%m%d0000")
+    end_date = today.strftime("%Y%m%d2359")
+    
+    if not SERVICE_KEY:
+        return [], "G2B_API_KEY 시크릿이 설정되지 않았습니다."
+
+    servc_url = "https://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoServcPPSSrch01"
+    thng_url = "https://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoThngPPSSrch01"
+
+    raw_items = fetch_bids_from_endpoint(servc_url, start_date, end_date)
+    raw_items += fetch_bids_from_endpoint(thng_url, start_date, end_date)
+
     items = []
-    try:
-        res = get_session().get(base_url, params=params, timeout=(15, 30))
-        raw_items = res.json().get("response", {}).get("body", {}).get("items", [])
-        if isinstance(raw_items, dict): raw_items = [raw_items]
+    seen_ids = set()
 
-        for item in raw_items:
-            title = item.get("bidNtceNm") or item.get("title") or ""
-            # 발전사는 AI/예지보전/로봇/설비 등 관련 키워드가 있을 때만 엄선
-            matched = [k for k in ALL_KEYWORDS if k.lower() in title.lower()]
-            if matched:
-                dday_label, dday_class = calculate_dday(item.get("bidClseDt", "-"))
-                items.append({
-                    "org": org_name,
-                    "category": classify_category(title),
-                    "cat_class": "cat-cons",
-                    "title": f"[{org_name}] {title}",
-                    "tags": " ".join([f"#{k}" for k in matched[:4]]),
-                    "budget": "공고문 참조",
-                    "close_date": item.get("bidClseDt", "-"),
-                    "dday_text": dday_label,
-                    "dday_class": dday_class,
-                    "url": item.get("bidNtceDtlUrl") or ("https://www.kospo.co.kr" if "남부" in org_name else "https://www.iwest.co.kr")
-                })
-    except Exception as e:
-        print(f"{org_name} 수집 에러: {e}")
-    return items
+    for item in raw_items:
+        bid_name = item.get("bidNtceNm", "")
+        bid_no = item.get("bidNtceNo", "")
+        bid_ord = item.get("bidNtceOrd", "00")
+        
+        unique_id = f"{bid_no}-{bid_ord}"
+        if unique_id in seen_ids:
+            continue
+        seen_ids.add(unique_id)
+
+        # 팀 타깃 카테고리 매칭 판별
+        category, matched_kws = classify_target(bid_name)
+        
+        # 상세 직통 링크 생성
+        if bid_no:
+            direct_url = f"https://www.g2b.go.kr:8081/ep/invitation/publish/bidInfoDtl.do?bidno={bid_no}&bidseq={bid_ord}&releaseYn=Y&taskClCd=5"
+        else:
+            direct_url = item.get("bidNtceDtlUrl") or "https://www.g2b.go.kr"
+
+        try:
+            price_val = float(item.get("presmptPrce", 0) or item.get("bdgtAmt", 0) or 0)
+            if price_val >= 100000000:
+                budget_str = f"{price_val / 100000000:.1f} 억원"
+            elif price_val > 0:
+                budget_str = f"{int(price_val / 10000):,} 만원"
+            else:
+                budget_str = "규격서 참조"
+        except Exception:
+            budget_str = "규격서 참조"
+
+        close_dt = item.get("bidClseDt", "-")
+        dday_label, dday_class = calculate_dday(close_dt)
+
+        if matched_kws:
+            tags_str = " ".join([f"#{k}" for k in matched_kws[:4]])
+        else:
+            tags_str = "#일반입찰 #조달공고"
+
+        # 뱃지 CSS 클래스 지정
+        if category == "AI": cat_class = "cat-rd"
+        elif category == "소부장": cat_class = "cat-cons"
+        elif category == "용역": cat_class = "cat-bid"
+        else: cat_class = "cat-general"
+
+        items.append({
+            "org": item.get("dminsttNm") or item.get("orderInsttNm") or "조달청",
+            "category": category,
+            "cat_class": cat_class,
+            "title": bid_name,
+            "tags": tags_str,
+            "budget": budget_str,
+            "close_date": close_dt,
+            "dday_text": dday_label,
+            "dday_class": dday_class,
+            "url": direct_url
+        })
+
+    return items, ""
 
 def update_html():
-    # 4개 기관 데이터 통합
-    g2b_items = fetch_g2b()
-    iris_items = fetch_iris()
-    nb_items = fetch_power_bids(NB_KEY, "한국남부발전", "https://apis.data.go.kr/B551220/v2/getBidInfoList")
-    sb_items = fetch_power_bids(SB_KEY, "한국서부발전", "https://apis.data.go.kr/B551224/v1/getBidInfoList")
-    
-    bids = g2b_items + iris_items + nb_items + sb_items
-    print(f"통합 수집 완료: 나라장터({len(g2b_items)}), IRIS({len(iris_items)}), 남부발전({len(nb_items)}), 서부발전({len(sb_items)}) / 총 {len(bids)}건")
+    bids, err_msg = fetch_real_bids()
+    print(f"최종 수집된 전체 공고: {len(bids)}건")
 
     with open("index.html", "r", encoding="utf-8") as f:
         html = f.read()
@@ -203,16 +164,17 @@ def update_html():
     week_str = f"{now.year}년 {now.month}월 {(now.day - 1) // 7 + 1}주차"
 
     html = re.sub(r'id="metaWeek">.*?</div>', f'id="metaWeek"><strong>기준 주차:</strong> {week_str}</div>', html)
-    html = re.sub(r'id="metaSync">.*?</div>', f'id="metaSync"><strong>최근 동기화:</strong> {now_str} (통합 연동)</div>', html)
+    html = re.sub(r'id="metaSync">.*?</div>', f'id="metaSync"><strong>최근 동기화:</strong> {now_str} (실시간 갱신)</div>', html)
 
+    # 4대 카드 수치 산정
     total_cnt = len(bids)
     urgent_cnt = sum(1 for b in bids if "urgent" in b["dday_class"])
-    ai_cnt = sum(1 for b in bids if b["category"] in ["AI", "소부장"])
+    team_target_cnt = sum(1 for b in bids if b["category"] in ["AI", "소부장", "용역"])
 
     html = re.sub(r'id="statTotal">.*?<span', f'id="statTotal">{total_cnt} <span', html)
     html = re.sub(r'id="statUrgent">.*?<span', f'id="statUrgent">{urgent_cnt} <span', html)
-    html = re.sub(r'id="statAi">.*?<span', f'id="statAi">{ai_cnt} <span', html)
-    html = re.sub(r'id="statBudget">.*?<span', f'id="statBudget">{max(total_cnt * 2.8, 10.0):.1f} 억원 <span', html)
+    html = re.sub(r'id="statAi">.*?<span', f'id="statAi">{team_target_cnt} <span', html)
+    html = re.sub(r'id="statBudget">.*?<span', f'id="statBudget">{max(total_cnt * 1.8, 0):.1f} 억원 <span', html)
 
     if bids:
         rows_html = ""
@@ -220,27 +182,28 @@ def update_html():
             rows_html += f"""
         <tr data-category="{b['category']}">
           <td>
-            <span class="badge-org">{b['org']}</span>
+            <span class="badge-org">{b['org'][:12]}</span>
             <span class="badge-category {b['cat_class']}">{b['category']}</span>
           </td>
           <td class="title-cell">
             <a href="{b['url']}" target="_blank" class="title-link">{b['title']}</a>
             <div class="tags-list">{b['tags']}</div>
           </td>
-          <td><strong>{b['budget']}</strong></td>
+          <td><strong>{b['budget']}</strong><br><span style="font-size:12px; color:#64748b;">(추정가격)</span></td>
           <td>
             <span class="dday-tag {b['dday_class']}">{b['dday_text']}</span>
             <div style="font-size:12px; color:#64748b; margin-top:2px;">{b['close_date']}</div>
           </td>
           <td>
-            <a href="{b['url']}" target="_blank" class="btn-action">공고 바로가기 ↗</a>
+            <a href="{b['url']}" target="_blank" class="btn-action">공고문 ↗</a>
           </td>
         </tr>"""
     else:
-        rows_html = """
+        msg = err_msg if err_msg else "최근 60일간 수집된 공고가 없습니다."
+        rows_html = f"""
         <tr>
-          <td colspan="5" style="text-align:center; padding: 40px; color: #64748b;">
-            현재 기준 수집된 신규 공고가 없거나 API 인증키 연계 중입니다.
+          <td colspan="5" style="text-align:center; padding: 40px; color: #ef4444; font-weight:600;">
+            ⚠️ {msg}
           </td>
         </tr>"""
 
@@ -248,7 +211,7 @@ def update_html():
 
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print("index.html 통합 갱신 완료!")
+    print("동기화 완료!")
 
 if __name__ == "__main__":
     update_html()
