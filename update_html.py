@@ -1,13 +1,17 @@
 import os
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import urllib.parse
 from datetime import datetime, timedelta
 import re
 
+# 1. API 키 처리
 SERVICE_KEY = os.getenv("G2B_API_KEY", "").strip()
 if "%" in SERVICE_KEY:
     SERVICE_KEY = urllib.parse.unquote(SERVICE_KEY)
 
+# 2. 키워드 및 카테고리 정의
 CATEGORY_RULES = {
     "AI": ["AI", "인공지능", "LLM", "딥러닝", "머신러닝", "비전", "알고리즘", "지능형", "데이터", "빅데이터"],
     "소부장": ["소부장", "소재", "부품", "장비", "스마트", "공정", "반도체", "센서", "배터리", "이차전지", "제조", "로봇", "자동화", "설계", "검사", "카메라"],
@@ -38,16 +42,29 @@ def calculate_dday(close_dt_str):
         pass
     return "진행중", "dday-safe"
 
+def get_robust_session():
+    """네트워크 타임아웃 및 일시적 단절에 대비한 재시도 세션 생성"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=4,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
 def fetch_real_bids():
     today = datetime.today()
-    # 최근 14일간 공고 수집
     start_date = (today - timedelta(days=14)).strftime("%Y%m%d0000")
     end_date = today.strftime("%Y%m%d2359")
     
     url = "https://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoServcPPSSrch01"
     params = {
         "serviceKey": SERVICE_KEY,
-        "numOfRows": "300",
+        "numOfRows": "100", # 응답 지연 방지를 위해 안정적인 100건으로 조정
         "pageNo": "1",
         "inqryDiv": "1",
         "inqryBgnDt": start_date,
@@ -59,12 +76,14 @@ def fetch_real_bids():
     if not SERVICE_KEY:
         return items, "G2B_API_KEY 시크릿이 설정되지 않았습니다."
 
+    session = get_robust_session()
+
     try:
-        res = requests.get(url, params=params, timeout=20)
+        # 연결 타임아웃(30초), 읽기 타임아웃(60초) 설정
+        res = session.get(url, params=params, timeout=(30, 60))
         
-        # API 인증키 오류 등으로 XML 에러문구가 올 때 처리
         if res.text.strip().startswith("<"):
-            return items, "공공데이터포털 인증키 승인 연계 중이거나 키가 일치하지 않습니다."
+            return items, "공공데이터포털 인증키 승인 연계 중이거나 권한 에러입니다."
 
         data = res.json()
         raw_items = data.get("response", {}).get("body", {}).get("items", [])
@@ -80,7 +99,7 @@ def fetch_real_bids():
                 bid_no = item.get("bidNtceNo", "")
                 bid_ord = item.get("bidNtceOrd", "00")
                 
-                # 공고 상세 화면 직통 링크
+                # 공고 상세 직통 링크
                 if bid_no:
                     direct_url = f"https://www.g2b.go.kr:8081/ep/invitation/publish/bidInfoDtl.do?bidno={bid_no}&bidseq={bid_ord}&releaseYn=Y&taskClCd=5"
                 else:
@@ -114,7 +133,7 @@ def fetch_real_bids():
                 })
         return items, ""
     except Exception as e:
-        return items, f"수집 에러: {e}"
+        return items, f"서버 통신 지연(재시도 실패): {e}"
 
 def update_html():
     bids, err_msg = fetch_real_bids()
@@ -127,11 +146,9 @@ def update_html():
     now_str = now.strftime("%Y-%m-%d %H:%M")
     week_str = f"{now.year}년 {now.month}월 {(now.day - 1) // 7 + 1}주차"
 
-    # 상단 메타 날짜 업데이트
     html = re.sub(r'id="metaWeek">.*?</div>', f'id="metaWeek"><strong>기준 주차:</strong> {week_str}</div>', html)
     html = re.sub(r'id="metaSync">.*?</div>', f'id="metaSync"><strong>최근 동기화:</strong> {now_str} (실시간 동기화)</div>', html)
 
-    # 4대 카드 수치 업데이트
     total_cnt = len(bids)
     urgent_cnt = sum(1 for b in bids if "urgent" in b["dday_class"])
     ai_cnt = sum(1 for b in bids if b["category"] in ["AI", "소부장"])
@@ -141,7 +158,6 @@ def update_html():
     html = re.sub(r'id="statAi">.*?<span', f'id="statAi">{ai_cnt} <span', html)
     html = re.sub(r'id="statBudget">.*?<span', f'id="statBudget">{total_cnt * 3.5:.1f} 억원 <span', html)
 
-    # 테이블 본문 교체
     if bids:
         rows_html = ""
         for b in bids:
@@ -177,7 +193,7 @@ def update_html():
 
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print("완벽 동기화 완료!")
+    print("동기화 완료!")
 
 if __name__ == "__main__":
     update_html()
