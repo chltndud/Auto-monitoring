@@ -2,27 +2,33 @@ name: Update Tender Dashboard
 
 on:
   schedule:
-    - cron: '0 0 * * 1-5' # 매주 월~금 자정(UTC 기준)에 자동 실행
+    - cron: '0 0 * * 1-5' # 매주 월~금 자동 실행
   workflow_dispatch: # 수동 실행 버튼 활성화
+
+permissions:
+  contents: write
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install Dependencies
-        run: pip install requests
+        run: pip install requests urllib3
 
       - name: Run Scraper Script
         env:
           G2B_API_KEY: ${{ secrets.G2B_API_KEY }}
+          IRIS_API_KEY: ${{ secrets.IRIS_API_KEY }}
+          SB_API_KEY: ${{ secrets.SB_API_KEY }}
+          NB_API_KEY: ${{ secrets.NB_API_KEY }}
         run: python update_html.py
 
       - name: Commit and Push Changes
@@ -30,5 +36,5 @@ jobs:
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           git add index.html
-          git commit -m "Automated update of tender dashboard" || echo "No changes to commit"
+          git commit -m "Automated update of multi-portal tender dashboard" || echo "No changes to commit"
           git push
