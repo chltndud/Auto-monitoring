@@ -6,16 +6,15 @@ import urllib.parse
 from datetime import datetime, timedelta
 import re
 
-# 1. API 키 처리
 SERVICE_KEY = os.getenv("G2B_API_KEY", "").strip()
 if "%" in SERVICE_KEY:
     SERVICE_KEY = urllib.parse.unquote(SERVICE_KEY)
 
-# 2. 핵심 관심 키워드
+# 관심 기술 및 도메인 분류 키워드
 CATEGORY_RULES = {
-    "AI": ["AI", "인공지능", "LLM", "딥러닝", "머신러닝", "비전", "알고리즘", "지능형", "데이터"],
-    "소부장": ["소부장", "소재", "부품", "장비", "스마트", "공정", "반도체", "센서", "배터리", "이차전지", "제조", "로봇", "자동화", "설계", "검사"],
-    "용역": ["용역", "연구", "개발", "R&D", "구축", "플랫폼", "시스템", "SW", "소프트웨어", "실증"]
+    "AI": ["AI", "인공지능", "LLM", "딥러닝", "머신러닝", "비전", "알고리즘", "지능형", "데이터", "빅데이터", "플랫폼"],
+    "소부장": ["소부장", "소재", "부품", "장비", "스마트", "공정", "반도체", "센서", "배터리", "이차전지", "제조", "로봇", "자동화", "설계", "검사", "카메라", "모듈", "컨베이어", "제어"],
+    "용역": ["용역", "연구", "개발", "R&D", "구축", "시스템", "SW", "소프트웨어", "실증", "전략", "기획", "ISP", "표준화"]
 }
 
 ALL_KEYWORDS = [kw for kws in CATEGORY_RULES.values() for kw in kws]
@@ -33,25 +32,25 @@ def calculate_dday(close_dt_str):
             close_date = datetime.strptime(clean_str, "%Y%m%d").date()
             today = datetime.now().date()
             diff = (close_date - today).days
-            if diff < 0: return "마감", "dday-urgent"
-            elif diff == 0: return "D-Day", "dday-urgent"
-            elif diff <= 7: return f"D-{diff}", "dday-urgent"
-            elif diff <= 14: return f"D-{diff}", "dday-normal"
-            else: return f"D-{diff}", "dday-safe"
+            if diff < 0: return "마감", "dday-urgent", True
+            elif diff == 0: return "D-Day", "dday-urgent", False
+            elif diff <= 7: return f"D-{diff}", "dday-urgent", False
+            elif diff <= 14: return f"D-{diff}", "dday-normal", False
+            else: return f"D-{diff}", "dday-safe", False
     except Exception:
         pass
-    return "진행중", "dday-safe"
+    return "진행중", "dday-safe", False
 
 def fetch_real_bids():
     today = datetime.today()
-    # 통신 지연을 방지하기 위해 최근 5일 데이터로 슬림화
-    start_date = (today - timedelta(days=5)).strftime("%Y%m%d0000")
+    # 최근 30일간 공고를 넉넉하게 조회
+    start_date = (today - timedelta(days=30)).strftime("%Y%m%d0000")
     end_date = today.strftime("%Y%m%d2359")
     
     url = "https://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoServcPPSSrch01"
     params = {
         "serviceKey": SERVICE_KEY,
-        "numOfRows": "60", # 타임아웃 방지를 위해 가볍게 요청
+        "numOfRows": "150",
         "pageNo": "1",
         "inqryDiv": "1",
         "inqryBgnDt": start_date,
@@ -59,7 +58,6 @@ def fetch_real_bids():
         "type": "json"
     }
     
-    # 해외 가상서버 차단 방지를 위한 브라우저 헤더
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json"
@@ -77,7 +75,7 @@ def fetch_real_bids():
         res = session.get(url, params=params, headers=headers, timeout=(15, 30))
         
         if res.text.strip().startswith("<"):
-            return items, "공공데이터포털 인증키 승인 연계 중입니다. (신청 후 1~2시간 소요)"
+            return items, "공공데이터포털 인증키 승인 연계 중입니다."
 
         data = res.json()
         raw_items = data.get("response", {}).get("body", {}).get("items", [])
@@ -89,11 +87,17 @@ def fetch_real_bids():
             matched = [k for k in ALL_KEYWORDS if k.lower() in bid_name.lower()]
             
             if matched:
+                close_dt = item.get("bidClseDt", "-")
+                dday_label, dday_class, is_expired = calculate_dday(close_dt)
+                
+                # 이미 마감된 공고는 제외하고 현재 진행 중인 공고만 선별
+                if is_expired:
+                    continue
+
                 category = classify_category(bid_name)
                 bid_no = item.get("bidNtceNo", "")
                 bid_ord = item.get("bidNtceOrd", "00")
                 
-                # 공고 상세페이지 직통 링크
                 if bid_no:
                     direct_url = f"https://www.g2b.go.kr:8081/ep/invitation/publish/bidInfoDtl.do?bidno={bid_no}&bidseq={bid_ord}&releaseYn=Y&taskClCd=5"
                 else:
@@ -110,9 +114,6 @@ def fetch_real_bids():
                 except Exception:
                     budget_str = "규격서 참조"
 
-                close_dt = item.get("bidClseDt", "-")
-                dday_label, dday_class = calculate_dday(close_dt)
-
                 items.append({
                     "org": item.get("dminsttNm") or item.get("orderInsttNm") or "조달청",
                     "category": category,
@@ -127,11 +128,11 @@ def fetch_real_bids():
                 })
         return items, ""
     except Exception as e:
-        return items, f"공공데이터 서버 통신 오류: {e}"
+        return items, f"공공데이터 통신 오류: {e}"
 
 def update_html():
     bids, err_msg = fetch_real_bids()
-    print(f"최종 수집된 공고: {len(bids)}건")
+    print(f"현재 유효 공고 수집 결과: {len(bids)}건")
 
     with open("index.html", "r", encoding="utf-8") as f:
         html = f.read()
@@ -175,11 +176,11 @@ def update_html():
           </td>
         </tr>"""
     else:
-        msg = err_msg if err_msg else "최근 5일간 조건에 부합하는 신규 공고가 없습니다."
+        msg = err_msg if err_msg else "현재 접수 진행 중인 관심 공고가 없습니다."
         rows_html = f"""
         <tr>
-          <td colspan="5" style="text-align:center; padding: 40px; color: #ef4444; font-weight:600;">
-            ⚠️ {msg}
+          <td colspan="5" style="text-align:center; padding: 40px; color: #64748b;">
+            ℹ️ {msg}
           </td>
         </tr>"""
 
