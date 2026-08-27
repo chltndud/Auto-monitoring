@@ -50,20 +50,22 @@ def check_deadline_from_text(row_text):
                 else: return close_dt_str, f"D-{diff}", "dday-safe"
             except:
                 pass
-    return "진행중(확인)", "진행중", "dday-safe"
+    return "상세 확인", "진행중", "dday-safe"
 
-# ----------------- [방식 1] 한국기계연구원 전용 크롤러 (과거 성공 방식 복구) -----------------
+# =====================================================================
+# 1. 한국기계연구원 (KIMM) 맞춤형 크롤러 (과거 성공했던 안정적인 방식 복구)
+# =====================================================================
 def scrape_kimm():
     items = []
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get("https://www.kimm.re.kr/bidding", headers=headers, verify=False, timeout=10)
+        url = "https://www.kimm.re.kr/bidding"
+        res = requests.get(url, headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 기계연구원만의 엄격한 표(Table) 구조 분석 적용 (가장 깔끔함)
-        for row in soup.select("table tbody tr") or soup.find_all("tr"):
+        # 기계연 특유의 정확한 7칸(td) 표기법 활용 (잡동사니 완벽 차단)
+        for row in soup.find_all("tr"):
             cols = row.find_all("td")
-            # 표의 칸(td)이 7개 이상인 '진짜 공고글' 행만 취급 (메뉴/잡다한 글씨 완벽 차단)
             if len(cols) >= 7:
                 title_elem = cols[2].find("a")
                 if not title_elem: continue
@@ -72,11 +74,8 @@ def scrape_kimm():
                 link = title_elem.get("href", "")
                 if link.startswith("/"): link = "https://www.kimm.re.kr" + link
                 
-                row_text = row.get_text(separator=" ")
-                close_dt, dday_label, dday_class = check_deadline_from_text(row_text)
-                
-                if dday_label == "마감": 
-                    continue
+                close_dt, dday_label, dday_class = check_deadline_from_text(row.get_text(separator=" "))
+                if dday_label == "마감": continue
                     
                 category, matched = classify_target(title)
                 items.append({
@@ -86,7 +85,7 @@ def scrape_kimm():
                     "title": title,
                     "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#출연연공고",
                     "budget": "공고문 참조",
-                    "close_date": cols[6].get_text(strip=True),
+                    "close_date": cols[6].get_text(strip=True), # 확실한 기계연 날짜 위치
                     "dday_text": dday_label,
                     "dday_class": dday_class,
                     "url": link
@@ -95,88 +94,160 @@ def scrape_kimm():
         print(f"[한국기계연구원 오류]: {e}")
     return items
 
-# ----------------- [방식 2] 타 기관용 만능 크롤러 (하드 크롤링 + 쓰레기 데이터 필터 강화) -----------------
-def generic_scrape(url, org_name, default_category, base_url):
+# =====================================================================
+# 2. 한국생산기술연구원 (KITECH) 맞춤형 크롤러
+# =====================================================================
+def scrape_kitech():
     items = []
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "Accept-Language": "ko-KR,ko;q=0.9"
-        }
-        res = requests.get(url, headers=headers, verify=False, timeout=15)
+        url = "https://www.kitech.re.kr/bbs/page1.php"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        res = requests.get(url, headers=headers, verify=False, timeout=10)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        rows = soup.select("table tr, .board_list li, .list_tbl tr, .board-list li, .bd_list li")
-        
-        # 쓰레기 데이터(메뉴, 엠블럼 등) 필터링을 위한 차단 키워드 목록
-        junk_keywords = ["오시는길", "개인정보", "이메일무단", "로그인", "회원가입", "사이트맵", "홈으로", "조직도", "인사말", "자세히보기", "첨부파일"]
-        
-        for row in rows:
-            a_tag = row.find("a")
-            if not a_tag: continue
+        # th(머리글)가 없는 순수 데이터 행(tr)만 수집
+        for tr in soup.find_all("tr"):
+            if tr.find("th"): continue 
             
+            a_tags = tr.find_all("a")
+            if not a_tags: continue
+            
+            # 해당 행에서 가장 긴 텍스트를 가진 a태그를 공고 제목으로 인식
+            a_tag = max(a_tags, key=lambda x: len(x.get_text(strip=True)))
             title = a_tag.get_text(strip=True)
+            if len(title) < 6: continue
             
-            # 1. 길이 및 차단 키워드로 쓰레기 텍스트 원천 방어
-            if len(title) < 8 or title.isdigit() or any(jk in title.replace(" ", "") for jk in junk_keywords):
-                continue
-                
             href = a_tag.get("href", "")
-            if not href or href.startswith("#") or "javascript:void" in href:
-                continue
+            link = url # 자바스크립트로 숨겨진 경우를 대비해 기본 게시판 URL 셋팅
+            if href and href.startswith("http"): link = href
+            elif href and not href.startswith("#") and not href.startswith("javascript"):
+                link = "https://www.kitech.re.kr/bbs/" + href.lstrip("/")
 
-            link = href
-            if not link.startswith("http") and not link.startswith("javascript"):
-                if link.startswith("/"): 
-                    link = base_url + link
-                else: 
-                    link = url.split('?')[0] + "/" + link if '?' not in link else base_url + "/" + link
+            close_dt, dday_label, dday_class = check_deadline_from_text(tr.get_text(separator=" "))
+            if dday_label == "마감": continue
             
-            row_text = row.get_text(separator=" ")
-            close_dt, dday_label, dday_class = check_deadline_from_text(row_text)
-            
-            if dday_label == "마감": 
-                continue
-                
-            if any(item['title'] == title for item in items):
-                continue
-                
             category, matched = classify_target(title)
-            if category == "일반": category = default_category
-            cat_class = "cat-rd" if category == "AI" else "cat-cons" if category == "소부장" else "cat-bid"
-            
             items.append({
-                "org": org_name,
-                "category": category,
-                "cat_class": cat_class,
+                "org": "한국생산기술연구원",
+                "category": category if category != "일반" else "소부장",
+                "cat_class": "cat-cons",
                 "title": title,
-                "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else f"#{org_name[:2]}공고",
+                "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#제조공정",
                 "budget": "공고문 참조",
                 "close_date": close_dt,
                 "dday_text": dday_label,
                 "dday_class": dday_class,
                 "url": link
             })
-            
-            if len(items) >= 10: 
-                break
-                
     except Exception as e:
-        print(f"[{org_name} 크롤링 오류]: {e}")
+        print(f"[한국생산기술연구원 오류]: {e}")
+    return items
+
+# =====================================================================
+# 3. 한국로봇산업진흥원 (KIRIA) 맞춤형 크롤러
+# =====================================================================
+def scrape_kiria():
+    items = []
+    try:
+        url = "https://www.kiria.org/portal/bidding/portalBiddingList.do"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        res = requests.get(url, headers=headers, verify=False, timeout=10)
+        res.encoding = res.apparent_encoding
+        soup = BeautifulSoup(res.text, 'html.parser')
         
+        for tr in soup.find_all("tr"):
+            if tr.find("th"): continue 
+            
+            a_tags = tr.find_all("a")
+            if not a_tags: continue
+            
+            a_tag = max(a_tags, key=lambda x: len(x.get_text(strip=True)))
+            title = a_tag.get_text(strip=True)
+            if len(title) < 6: continue
+            
+            href = a_tag.get("href", "")
+            link = url
+            if href and href.startswith("http"): link = href
+            elif href and not href.startswith("#") and not href.startswith("javascript"):
+                link = "https://www.kiria.org" + href if href.startswith("/") else url.split("?")[0] + "/" + href
+
+            close_dt, dday_label, dday_class = check_deadline_from_text(tr.get_text(separator=" "))
+            if dday_label == "마감": continue
+            
+            category, matched = classify_target(title)
+            items.append({
+                "org": "한국로봇산업진흥원",
+                "category": category if category != "일반" else "소부장",
+                "cat_class": "cat-cons",
+                "title": title,
+                "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#로봇자동화",
+                "budget": "공고문 참조",
+                "close_date": close_dt,
+                "dday_text": dday_label,
+                "dday_class": dday_class,
+                "url": link
+            })
+    except Exception as e:
+        print(f"[한국로봇산업진흥원 오류]: {e}")
+    return items
+
+# =====================================================================
+# 4. 국방기술품질원 (DTaQ) 맞춤형 크롤러
+# =====================================================================
+def scrape_dtaq():
+    items = []
+    try:
+        url = "https://www.dtaq.re.kr/ko/notice/tender.jsp"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        res = requests.get(url, headers=headers, verify=False, timeout=10)
+        res.encoding = res.apparent_encoding
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        for tr in soup.find_all("tr"):
+            if tr.find("th"): continue 
+            
+            a_tags = tr.find_all("a")
+            if not a_tags: continue
+            
+            a_tag = max(a_tags, key=lambda x: len(x.get_text(strip=True)))
+            title = a_tag.get_text(strip=True)
+            if len(title) < 6: continue
+            
+            href = a_tag.get("href", "")
+            link = url
+            if href and href.startswith("http"): link = href
+            elif href and not href.startswith("#") and not href.startswith("javascript"):
+                link = "https://www.dtaq.re.kr" + href if href.startswith("/") else url.split("?")[0] + "/" + href
+
+            close_dt, dday_label, dday_class = check_deadline_from_text(tr.get_text(separator=" "))
+            if dday_label == "마감": continue
+            
+            category, matched = classify_target(title)
+            items.append({
+                "org": "국방기술품질원",
+                "category": category if category != "일반" else "소부장",
+                "cat_class": "cat-cons",
+                "title": title,
+                "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#방위산업",
+                "budget": "공고문 참조",
+                "close_date": close_dt,
+                "dday_text": dday_label,
+                "dday_class": dday_class,
+                "url": link
+            })
+    except Exception as e:
+        print(f"[국방기술품질원 오류]: {e}")
     return items
 
 def update_html():
     bids = []
     
-    # 1. 기계연구원은 맞춤형 함수 사용
+    # 4개 기관의 독립 맞춤형 크롤러를 순차적으로 실행
     bids += scrape_kimm()
-    
-    # 2. 다른 사이트는 필터가 강화된 만능 크롤러 사용
-    bids += generic_scrape("https://www.kitech.re.kr/pages/25", "한국생산기술연구원", "소부장", "https://www.kitech.re.kr")
-    bids += generic_scrape("https://www.kiria.org/portal/bidding/portalBiddingList.do", "한국로봇산업진흥원", "소부장", "https://www.kiria.org")
-    bids += generic_scrape("https://www.dtaq.re.kr/ko/notice/tender.jsp", "국방기술품질원", "소부장", "https://www.dtaq.re.kr")
+    bids += scrape_kitech()
+    bids += scrape_kiria()
+    bids += scrape_dtaq()
     
     with open("index.html", "r", encoding="utf-8") as f:
         html = f.read()
