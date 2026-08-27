@@ -56,42 +56,44 @@ def generic_scrape(url, org_name, default_category, base_url):
     items = []
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept-Language": "ko-KR,ko;q=0.9"
         }
         res = requests.get(url, headers=headers, verify=False, timeout=15)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 핵심 수정: 사이트 전체가 아닌 '게시판 표(Table)' 내부 행(Row)만 엄격하게 탐색
-        # 이 조건을 통해 엠블럼, 회사소개 같은 쓸데없는 상/하단 메뉴 링크가 차단됩니다.
-        rows = soup.select("table tbody tr")
+        # 1. 엠블럼 등 홈페이지 메뉴 링크를 차단하기 위해 [표, 리스트] 등 게시판 구조 내부만 탐색
+        # tbody 누락 문제를 해결하기 위해 'table tr'로 포괄적 탐색
+        rows = soup.select("table tr, .board_list li, .list_tbl tr, .board-list li, .bd_list li")
         
-        # 만약 테이블 구조가 아닌 리스트형 게시판일 경우를 대비한 백업 셀렉터
-        if not rows:
-            rows = soup.select(".board_list li, .list_tbl tr")
-            
         for row in rows:
             a_tag = row.find("a")
             if not a_tag: continue
             
             title = a_tag.get_text(strip=True)
             
-            # 메뉴 버튼이나 지나치게 짧은 쓰레기 텍스트 제외
-            if len(title) < 6 or title.isdigit() or title in ["이전", "다음", "새글", "첨부파일"]:
+            # 2. 메뉴 버튼, 페이지 번호 등 지나치게 짧은 글씨 완벽 차단
+            if len(title) < 10 or title.isdigit() or title in ["자세히보기", "첨부파일", "다운로드", "바로가기", "새글"]:
                 continue
                 
             href = a_tag.get("href", "")
-            if not href or href.startswith("#") or "javascript" in href:
+            
+            # 3. 진짜 더미 링크 차단 (단, 정부 사이트에서 주로 쓰는 javascript: 이동 함수는 허용)
+            if not href or href.startswith("#"):
+                continue
+            clean_href = href.replace(" ", "")
+            if clean_href == "javascript:void(0);" or clean_href == "javascript:;":
                 continue
 
             link = href
-            if not link.startswith("http"):
+            if not link.startswith("http") and not link.startswith("javascript"):
                 if link.startswith("/"): 
                     link = base_url + link
                 else: 
                     link = url.split('?')[0] + "/" + link if '?' not in link else base_url + "/" + link
             
+            # 날짜를 추출하기 위해 a 태그가 포함된 행(tr) 텍스트 전체를 읽어옴
             row_text = row.get_text(separator=" ")
             close_dt, dday_label, dday_class = check_deadline_from_text(row_text)
             
@@ -118,7 +120,8 @@ def generic_scrape(url, org_name, default_category, base_url):
                 "url": link
             })
             
-            if len(items) >= 10: 
+            # 기관당 최대 수집 건수 (화면 도배 방지)
+            if len(items) >= 12: 
                 break
                 
     except Exception as e:
