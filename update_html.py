@@ -10,7 +10,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 CATEGORY_RULES = {
     "AI": ["AI", "인공지능", "딥러닝", "머신러닝", "비전", "알고리즘", "데이터", "빅데이터", "플랫폼", "SW", "자율", "지능형", "제어"],
     "소부장": ["장비", "공정", "반도체", "센서", "배터리", "이차전지", "로봇", "자동화", "검사", "카메라", "모듈", "기구", "설계", "컨베이어", "시제품", "가공", "동력", "프레임", "무인", "방산", "기계", "핸들러"],
-    "용역": ["연구", "개발", "R&D", "구축", "실증", "기획", "분석", "표준화", "시험", "용역", "폐기물", "공사", "구매", "용역"]
+    "용역": ["연구", "개발", "R&D", "구축", "실증", "기획", "분석", "표준화", "시험", "용역", "폐기물", "공사", "구매"]
 }
 
 def classify_target(title):
@@ -53,41 +53,38 @@ def check_deadline_from_text(row_text):
     return "진행중(확인)", "진행중", "dday-safe"
 
 def generic_scrape(url, org_name, default_category, base_url):
-    """
-    특정 태그(table, tr)에 의존하지 않고 페이지 내의 모든 하이퍼링크(a)를 탐색해
-    '공고글'의 패턴을 가진 요소만 똑똑하게 뽑아내는 만능 크롤러
-    """
     items = []
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+            "Accept-Language": "ko-KR,ko;q=0.9"
         }
         res = requests.get(url, headers=headers, verify=False, timeout=15)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 페이지 내 모든 링크 요소 탐색
-        a_tags = soup.find_all("a")
+        # 핵심 수정: 사이트 전체가 아닌 '게시판 표(Table)' 내부 행(Row)만 엄격하게 탐색
+        # 이 조건을 통해 엠블럼, 회사소개 같은 쓸데없는 상/하단 메뉴 링크가 차단됩니다.
+        rows = soup.select("table tbody tr")
         
-        for a in a_tags:
-            title = a.get_text(strip=True)
+        # 만약 테이블 구조가 아닌 리스트형 게시판일 경우를 대비한 백업 셀렉터
+        if not rows:
+            rows = soup.select(".board_list li, .list_tbl tr")
             
-            # 너무 짧은 단어(메뉴 버튼)나 숫자로만 된 텍스트(페이지 번호)는 패스
-            if len(title) < 10 or title.isdigit() or title in ["새글", "첨부파일", "자세히보기", "개인정보처리방침"]:
-                continue
+        for row in rows:
+            a_tag = row.find("a")
+            if not a_tag: continue
             
-            href = a.get("href", "")
-            # 실제 이동하지 않는 자바스크립트 더미 링크 제외
-            if not href or href.startswith("#") or "javascript:void(0)" in href:
+            title = a_tag.get_text(strip=True)
+            
+            # 메뉴 버튼이나 지나치게 짧은 쓰레기 텍스트 제외
+            if len(title) < 6 or title.isdigit() or title in ["이전", "다음", "새글", "첨부파일"]:
                 continue
                 
-            # 휴리스틱: 링크에 뷰어 파라미터나 고유 ID가 없는데 텍스트가 짧으면 일반 메뉴일 확률이 높음
-            if not any(kw in href.lower() for kw in ["?", "id=", "idx=", "seq=", "num=", "view", "read", "bbs", "page", "bidding", "tender"]):
-                if len(title) < 15:
-                    continue
+            href = a_tag.get("href", "")
+            if not href or href.startswith("#") or "javascript" in href:
+                continue
 
-            # 링크 URL 조합 (상대 경로인 경우 절대 경로로 변환)
             link = href
             if not link.startswith("http"):
                 if link.startswith("/"): 
@@ -95,17 +92,12 @@ def generic_scrape(url, org_name, default_category, base_url):
                 else: 
                     link = url.split('?')[0] + "/" + link if '?' not in link else base_url + "/" + link
             
-            # 날짜를 찾기 위해 해당 링크가 속한 가장 가까운 행(tr)이나 리스트(li)의 전체 텍스트를 추출
-            parent = a.find_parent("tr") or a.find_parent("li")
-            row_text = parent.get_text(separator=" ") if parent else title
-            
+            row_text = row.get_text(separator=" ")
             close_dt, dday_label, dday_class = check_deadline_from_text(row_text)
             
-            # 기한이 지난 공고 원천 배제
             if dday_label == "마감": 
                 continue
                 
-            # 동일한 공고글 중복 수집 방지
             if any(item['title'] == title for item in items):
                 continue
                 
@@ -126,7 +118,6 @@ def generic_scrape(url, org_name, default_category, base_url):
                 "url": link
             })
             
-            # 화면이 한 기관의 데이터로 덮이는 것을 막기 위해 최신순 10건만 수집
             if len(items) >= 10: 
                 break
                 
@@ -137,7 +128,6 @@ def generic_scrape(url, org_name, default_category, base_url):
 
 def update_html():
     bids = []
-    # 각 기관별 최신 입찰공고 보드 URL 업데이트
     bids += generic_scrape("https://www.kimm.re.kr/bidding", "한국기계연구원", "소부장", "https://www.kimm.re.kr")
     bids += generic_scrape("https://www.kitech.re.kr/pages/25", "한국생산기술연구원", "소부장", "https://www.kitech.re.kr")
     bids += generic_scrape("https://www.kiria.org/portal/bidding/portalBiddingList.do", "한국로봇산업진흥원", "소부장", "https://www.kiria.org")
@@ -150,7 +140,6 @@ def update_html():
     now = datetime.now(KST)
     now_str = now.strftime("%Y-%m-%d %H:%M")
     
-    # 깃허브 액션 링크 단축 버튼 (본인 저장소 주소로 변경하여 사용 가능)
     github_actions_url = "#" 
     sync_btn_html = f'<a href="{github_actions_url}" target="_blank" style="display:inline-block; background-color:#10b981; color:white; padding:3px 8px; border-radius:6px; text-decoration:none; font-size:11px; font-weight:bold; margin-right:8px; box-shadow:0 1px 2px rgba(0,0,0,0.1);">🔄 수동 동기화</a>'
     
