@@ -1,7 +1,7 @@
 import os
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 import urllib3
 
@@ -26,21 +26,8 @@ def classify_target(title):
         return found_cat, list(set(matched_tags))
     return "일반", []
 
-def calculate_dday(close_dt_str):
-    try:
-        clean_str = re.sub(r'[^0-9]', '', str(close_dt_str))[:8]
-        if len(clean_str) == 8:
-            close_date = datetime.strptime(clean_str, "%Y%m%d").date()
-            today = datetime.now().date()
-            diff = (close_date - today).days
-            if diff < 0: return "마감", "dday-urgent"
-            elif diff == 0: return "D-Day", "dday-urgent"
-            elif diff <= 7: return f"D-{diff}", "dday-urgent"
-            elif diff <= 14: return f"D-{diff}", "dday-normal"
-            else: return f"D-{diff}", "dday-safe"
-    except Exception:
-        pass
-    return "진행중", "dday-safe"
+def extract_safe_text(element):
+    return element.get_text(strip=True) if element else "-"
 
 # ----------------- [웹 크롤러 1] 한국기계연구원 (KIMM) -----------------
 def scrape_kimm():
@@ -49,32 +36,38 @@ def scrape_kimm():
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get("https://www.kimm.re.kr/bidding", headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
-        for row in soup.select("table tbody tr") or soup.find_all("tr"):
+        
+        # 탐색 조건 완화: table 안의 tr 또는 모든 tr 검색
+        rows = soup.select("table tbody tr") or soup.find_all("tr")
+        for row in rows:
+            a_tag = row.find("a")
+            if not a_tag: continue
+            
+            title = extract_safe_text(a_tag)
+            if len(title) < 5: continue # 너무 짧은 메뉴 텍스트 방어
+            
+            link = a_tag.get("href", "")
+            if link.startswith("/"): link = "https://www.kimm.re.kr" + link
+            
+            # 날짜 형식 파싱 시도 (기계연구원은 7번째 td에 날짜가 있음)
             cols = row.find_all("td")
-            if len(cols) >= 7:
-                title_elem = cols[2].find("a")
-                if not title_elem: continue
-                title = title_elem.get_text(strip=True)
-                link = title_elem.get("href", "")
-                if link.startswith("/"): link = "https://www.kimm.re.kr" + link
-                
-                category, matched = classify_target(title)
-                dday_label, dday_class = calculate_dday(cols[6].get_text(strip=True).replace("-", ""))
-                if dday_label != "마감":
-                    items.append({
-                        "org": "한국기계연구원",
-                        "category": category,
-                        "cat_class": "cat-cons" if category in ["소부장", "일반"] else "cat-rd",
-                        "title": title,
-                        "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#출연연공고",
-                        "budget": "공고문 참조",
-                        "close_date": cols[6].get_text(strip=True),
-                        "dday_text": dday_label,
-                        "dday_class": dday_class,
-                        "url": link
-                    })
+            close_dt = extract_safe_text(cols[6]) if len(cols) >= 7 else "확인 필요"
+            
+            category, matched = classify_target(title)
+            items.append({
+                "org": "한국기계연구원",
+                "category": category,
+                "cat_class": "cat-cons" if category in ["소부장", "일반"] else "cat-rd",
+                "title": title,
+                "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#출연연",
+                "budget": "공고문 참조",
+                "close_date": close_dt,
+                "dday_text": "진행중",
+                "dday_class": "dday-safe",
+                "url": link
+            })
     except Exception as e:
-        print(f"KIMM 크롤링 오류: {e}")
+        print(f"KIMM 오류: {e}")
     return items
 
 # ----------------- [웹 크롤러 2] 한국생산기술연구원 (KITECH) -----------------
@@ -82,30 +75,38 @@ def scrape_kitech():
     items = []
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
+        # 생기원 입찰공고 URL (실제 URL에 맞게 수정 필요 시 대비)
         res = requests.get("https://www.kitech.re.kr/bbs/page1.php", headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
-        for row in soup.select("table tbody tr"):
-            title_elem = row.find("a")
-            if not title_elem: continue
-            title = title_elem.get_text(strip=True)
-            link = "https://www.kitech.re.kr/bbs/" + title_elem.get("href", "")
+        
+        # 조건 대폭 완화: a 태그 중 href가 있는 것들 추출
+        rows = soup.find_all("tr")
+        for row in rows:
+            a_tag = row.find("a")
+            if not a_tag: continue
             
-            # 생산기술연구원 특성상 마감일이 명확히 표기되지 않은 경우가 많아 안전하게 진행중으로 처리
+            title = extract_safe_text(a_tag)
+            if len(title) < 5: continue
+            
+            link = a_tag.get("href", "")
+            if not link.startswith("http"):
+                link = "https://www.kitech.re.kr/bbs/" + link.lstrip("/")
+                
             category, matched = classify_target(title)
             items.append({
                 "org": "한국생산기술연구원",
-                "category": category,
+                "category": category if category != "일반" else "소부장",
                 "cat_class": "cat-cons",
                 "title": title,
                 "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#제조공정",
                 "budget": "공고문 참조",
-                "close_date": "사이트 확인",
+                "close_date": "진행중",
                 "dday_text": "진행중",
                 "dday_class": "dday-safe",
                 "url": link
             })
     except Exception as e:
-        print(f"KITECH 크롤링 오류: {e}")
+        print(f"KITECH 오류: {e}")
     return items
 
 # ----------------- [웹 크롤러 3] 한국로봇산업진흥원 (KIRIA) -----------------
@@ -115,11 +116,17 @@ def scrape_kiria():
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get("https://www.kiria.org/portal/bidding/portalBiddingList.do", headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
-        for row in soup.select("table tbody tr"):
-            title_elem = row.find("a")
-            if not title_elem: continue
-            title = title_elem.get_text(strip=True)
-            link = "https://www.kiria.org" + title_elem.get("href", "")
+        
+        rows = soup.find_all("tr")
+        for row in rows:
+            a_tag = row.find("a")
+            if not a_tag: continue
+            
+            title = extract_safe_text(a_tag)
+            if len(title) < 5: continue
+            
+            link = a_tag.get("href", "")
+            if link.startswith("/"): link = "https://www.kiria.org" + link
             
             category, matched = classify_target(title)
             items.append({
@@ -129,13 +136,13 @@ def scrape_kiria():
                 "title": title,
                 "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#로봇자동화",
                 "budget": "공고문 참조",
-                "close_date": "사이트 확인",
+                "close_date": "진행중",
                 "dday_text": "진행중",
                 "dday_class": "dday-safe",
                 "url": link
             })
     except Exception as e:
-        print(f"KIRIA 크롤링 오류: {e}")
+        print(f"KIRIA 오류: {e}")
     return items
 
 # ----------------- [웹 크롤러 4] 국방기술품질원 (DTaQ) -----------------
@@ -145,11 +152,16 @@ def scrape_dtaq():
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get("https://www.dtaq.re.kr/ko/notice/tender.jsp", headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
-        for row in soup.select("table tbody tr"):
-            title_elem = row.find("a")
-            if not title_elem: continue
-            title = title_elem.get_text(strip=True)
-            link = "https://www.dtaq.re.kr/ko/notice/tender.jsp"
+        
+        rows = soup.find_all("tr")
+        for row in rows:
+            a_tag = row.find("a")
+            if not a_tag: continue
+            
+            title = extract_safe_text(a_tag)
+            if len(title) < 5: continue
+            
+            link = "https://www.dtaq.re.kr/ko/notice/tender.jsp" # 상세 링크 파싱이 어려울 경우 메인으로 우회
             
             category, matched = classify_target(title)
             items.append({
@@ -159,28 +171,34 @@ def scrape_dtaq():
                 "title": title,
                 "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#방위산업",
                 "budget": "공고문 참조",
-                "close_date": "사이트 확인",
+                "close_date": "진행중",
                 "dday_text": "진행중",
                 "dday_class": "dday-safe",
                 "url": link
             })
     except Exception as e:
-        print(f"DTaQ 크롤링 오류: {e}")
+        print(f"DTaQ 오류: {e}")
     return items
 
 
 def update_html():
-    # 4개 기관 전면 크롤링 데이터 취합 (API 함수가 있다면 여기에 + fetch_g2b() 형태로 더함)
     bids = scrape_kimm() + scrape_kitech() + scrape_kiria() + scrape_dtaq()
     
-    print(f"웹 크롤링 결과 -> 총 {len(bids)}건 확보 완료.")
-
     with open("index.html", "r", encoding="utf-8") as f:
         html = f.read()
 
-    now = datetime.now()
+    # KST (한국 표준시, UTC+9) 적용
+    KST = timezone(timedelta(hours=9))
+    now = datetime.now(KST)
     now_str = now.strftime("%Y-%m-%d %H:%M")
+    
+    # 1. 최근 동기화 시간 업데이트 (KST 반영)
     html = re.sub(r'id="metaSync">.*?</div>', f'id="metaSync"><strong>최근 동기화:</strong> {now_str} (연구기관 다중 크롤러 작동)</div>', html)
+
+    # 2. 기준 주차 업데이트 (복구 완료)
+    week_num = (now.day - 1) // 7 + 1
+    week_str = f"{now.year}년 {now.month}월 {week_num}주차"
+    html = re.sub(r'id="metaWeek">.*?</div>', f'id="metaWeek"><strong>기준 주차:</strong> {week_str}</div>', html)
 
     total_cnt = len(bids)
     urgent_cnt = sum(1 for b in bids if "urgent" in b["dday_class"])
@@ -216,6 +234,7 @@ def update_html():
 
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
+    print(f"업데이트 완료: 총 {total_cnt}건 반영")
 
 if __name__ == "__main__":
     update_html()
