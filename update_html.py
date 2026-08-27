@@ -52,20 +52,65 @@ def check_deadline_from_text(row_text):
                 pass
     return "진행중(확인)", "진행중", "dday-safe"
 
+# ----------------- [방식 1] 한국기계연구원 전용 크롤러 (과거 성공 방식 복구) -----------------
+def scrape_kimm():
+    items = []
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.get("https://www.kimm.re.kr/bidding", headers=headers, verify=False, timeout=10)
+        soup = BeautifulSoup(res.text, 'html.parser')
+        
+        # 기계연구원만의 엄격한 표(Table) 구조 분석 적용 (가장 깔끔함)
+        for row in soup.select("table tbody tr") or soup.find_all("tr"):
+            cols = row.find_all("td")
+            # 표의 칸(td)이 7개 이상인 '진짜 공고글' 행만 취급 (메뉴/잡다한 글씨 완벽 차단)
+            if len(cols) >= 7:
+                title_elem = cols[2].find("a")
+                if not title_elem: continue
+                
+                title = title_elem.get_text(strip=True)
+                link = title_elem.get("href", "")
+                if link.startswith("/"): link = "https://www.kimm.re.kr" + link
+                
+                row_text = row.get_text(separator=" ")
+                close_dt, dday_label, dday_class = check_deadline_from_text(row_text)
+                
+                if dday_label == "마감": 
+                    continue
+                    
+                category, matched = classify_target(title)
+                items.append({
+                    "org": "한국기계연구원",
+                    "category": category,
+                    "cat_class": "cat-rd" if category == "AI" else "cat-cons" if category == "소부장" else "cat-bid" if category == "용역" else "cat-general",
+                    "title": title,
+                    "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#출연연공고",
+                    "budget": "공고문 참조",
+                    "close_date": cols[6].get_text(strip=True),
+                    "dday_text": dday_label,
+                    "dday_class": dday_class,
+                    "url": link
+                })
+    except Exception as e:
+        print(f"[한국기계연구원 오류]: {e}")
+    return items
+
+# ----------------- [방식 2] 타 기관용 만능 크롤러 (하드 크롤링 + 쓰레기 데이터 필터 강화) -----------------
 def generic_scrape(url, org_name, default_category, base_url):
     items = []
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "Accept-Language": "ko-KR,ko;q=0.9"
         }
         res = requests.get(url, headers=headers, verify=False, timeout=15)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # 1. 엠블럼 등 홈페이지 메뉴 링크를 차단하기 위해 [표, 리스트] 등 게시판 구조 내부만 탐색
-        # tbody 누락 문제를 해결하기 위해 'table tr'로 포괄적 탐색
         rows = soup.select("table tr, .board_list li, .list_tbl tr, .board-list li, .bd_list li")
+        
+        # 쓰레기 데이터(메뉴, 엠블럼 등) 필터링을 위한 차단 키워드 목록
+        junk_keywords = ["오시는길", "개인정보", "이메일무단", "로그인", "회원가입", "사이트맵", "홈으로", "조직도", "인사말", "자세히보기", "첨부파일"]
         
         for row in rows:
             a_tag = row.find("a")
@@ -73,17 +118,12 @@ def generic_scrape(url, org_name, default_category, base_url):
             
             title = a_tag.get_text(strip=True)
             
-            # 2. 메뉴 버튼, 페이지 번호 등 지나치게 짧은 글씨 완벽 차단
-            if len(title) < 10 or title.isdigit() or title in ["자세히보기", "첨부파일", "다운로드", "바로가기", "새글"]:
+            # 1. 길이 및 차단 키워드로 쓰레기 텍스트 원천 방어
+            if len(title) < 8 or title.isdigit() or any(jk in title.replace(" ", "") for jk in junk_keywords):
                 continue
                 
             href = a_tag.get("href", "")
-            
-            # 3. 진짜 더미 링크 차단 (단, 정부 사이트에서 주로 쓰는 javascript: 이동 함수는 허용)
-            if not href or href.startswith("#"):
-                continue
-            clean_href = href.replace(" ", "")
-            if clean_href == "javascript:void(0);" or clean_href == "javascript:;":
+            if not href or href.startswith("#") or "javascript:void" in href:
                 continue
 
             link = href
@@ -93,7 +133,6 @@ def generic_scrape(url, org_name, default_category, base_url):
                 else: 
                     link = url.split('?')[0] + "/" + link if '?' not in link else base_url + "/" + link
             
-            # 날짜를 추출하기 위해 a 태그가 포함된 행(tr) 텍스트 전체를 읽어옴
             row_text = row.get_text(separator=" ")
             close_dt, dday_label, dday_class = check_deadline_from_text(row_text)
             
@@ -120,8 +159,7 @@ def generic_scrape(url, org_name, default_category, base_url):
                 "url": link
             })
             
-            # 기관당 최대 수집 건수 (화면 도배 방지)
-            if len(items) >= 12: 
+            if len(items) >= 10: 
                 break
                 
     except Exception as e:
@@ -131,7 +169,11 @@ def generic_scrape(url, org_name, default_category, base_url):
 
 def update_html():
     bids = []
-    bids += generic_scrape("https://www.kimm.re.kr/bidding", "한국기계연구원", "소부장", "https://www.kimm.re.kr")
+    
+    # 1. 기계연구원은 맞춤형 함수 사용
+    bids += scrape_kimm()
+    
+    # 2. 다른 사이트는 필터가 강화된 만능 크롤러 사용
     bids += generic_scrape("https://www.kitech.re.kr/pages/25", "한국생산기술연구원", "소부장", "https://www.kitech.re.kr")
     bids += generic_scrape("https://www.kiria.org/portal/bidding/portalBiddingList.do", "한국로봇산업진흥원", "소부장", "https://www.kiria.org")
     bids += generic_scrape("https://www.dtaq.re.kr/ko/notice/tender.jsp", "국방기술품질원", "소부장", "https://www.dtaq.re.kr")
