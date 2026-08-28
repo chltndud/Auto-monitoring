@@ -9,7 +9,6 @@ import json
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =====================================================================
-# 연구원님의 실제 API 인증키가 하드코딩되어 있습니다.
 API_KEY = "yqd2J707PpMlQORvHoa0ZsjNNDqQM3Of%2BOmqs3p9kJXpkcwC2lc%2FzOR6R9MqPf6QyYyp0B0HnmjluOJh%2FBkzHA%3D%3D"
 # =====================================================================
 
@@ -68,37 +67,25 @@ def fetch_g2b_api():
     try:
         KST = timezone(timedelta(hours=9))
         now = datetime.now(KST)
-        # 검색 범위: 최근 14일
         bgn_dt = (now - timedelta(days=14)).strftime("%Y%m%d0000")
         end_dt = now.strftime("%Y%m%d2359")
         
-        # 공식 문서 기준, 새롭게 개편된 물품 및 용역 오퍼레이션
         endpoints = [
-            "getBidPblancListInfoThngPPSSrch",  # 물품 조회
-            "getBidPblancListInfoServcPPSSrch"  # 용역 조회
+            "getBidPblancListInfoThngPPSSrch",
+            "getBidPblancListInfoServcPPSSrch"
         ]
         
-        # 타깃 필터링 (불필요한 쓰레기 공고 차단용)
         target_orgs = ["생산기술연구원", "로봇산업진흥원", "국방기술품질원", "과학기술", "에너지기술연구원"]
         target_kws = ["컨베이어", "모듈", "검사", "자동화", "장비", "제어", "로봇", "AI", "기구"]
         
-        api_success_count = 0
-        
         for ep in endpoints:
-            # 폐기된 구주소가 아닌 최신 ad/BidPublicInfoService 경로 적용
             url = f"http://apis.data.go.kr/1230000/ad/BidPublicInfoService/{ep}?serviceKey={API_KEY}&numOfRows=500&pageNo=1&inqryDiv=1&inqryBgnDt={bgn_dt}&inqryEndDt={end_dt}&type=json"
-            
             res = requests.get(url, verify=False, timeout=20)
             
-            # XML(에러)이 아닌 정상 JSON 데이터를 받았을 경우
             if res.status_code == 200 and not res.text.strip().startswith("<"):
-                api_success_count += 1
                 data = res.json()
                 bids = data.get("response", {}).get("body", {}).get("items", [])
-                
-                # 리스트 형태가 아닌 경우(dict) 리스트로 변환
-                if isinstance(bids, dict): 
-                    bids = [bids]
+                if isinstance(bids, dict): bids = [bids]
                     
                 for bid in bids:
                     org_name = bid.get('dminsttNm') or bid.get('ntceInsttNm') or '조달청'
@@ -107,13 +94,37 @@ def fetch_g2b_api():
                     is_target_org = any(org in org_name for org in target_orgs)
                     is_target_kw = any(kw in title for kw in target_kws)
                     
-                    # 기관명이나 제목에 키워드가 있는 경우만 수집
                     if is_target_org or is_target_kw:
-                        category, matched = classify_target(title)
+                        close_dt_str = bid.get('bidClseDt', '')
+                        close_date_disp = "마감일 미정"
+                        dday_label, dday_class = "진행중", "dday-safe"
+                        is_expired = False
                         
-                        # 날짜 포맷 예쁘게 다듬기
-                        close_dt_str = bid.get('bidClseDt', '미정')[:8]
-                        close_date_disp = f"{close_dt_str[:4]}-{close_dt_str[4:6]}-{close_dt_str[6:]}" if len(close_dt_str) == 8 else close_dt_str
+                        # API 문서 형식 "YYYY-MM-DD HH:MM:SS" 대응
+                        if close_dt_str:
+                            date_part = close_dt_str.split(' ')[0]
+                            try:
+                                close_date = datetime.strptime(date_part, "%Y-%m-%d").date()
+                                close_date_disp = close_date.strftime("%Y-%m-%d")
+                                diff = (close_date - now.date()).days
+                                
+                                # 마감일이 지났으면 리스트에서 제외
+                                if diff < 0:
+                                    is_expired = True
+                                elif diff == 0:
+                                    dday_label, dday_class = "D-Day", "dday-urgent"
+                                elif diff <= 7:
+                                    dday_label, dday_class = f"D-{diff}", "dday-urgent"
+                                else:
+                                    dday_label, dday_class = f"D-{diff}", "dday-normal"
+                            except Exception:
+                                close_date_disp = date_part
+                        
+                        # 마감된 공고는 추가하지 않고 건너뜀
+                        if is_expired:
+                            continue
+                            
+                        category, matched = classify_target(title)
                         
                         items.append({
                             "org": org_name[:12], 
@@ -121,27 +132,14 @@ def fetch_g2b_api():
                             "cat_class": "cat-rd" if category == "AI" else "cat-cons", 
                             "title": title,
                             "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#조달청(매칭)", 
-                            "budget": "공고문 참조", "close_date": close_date_disp, 
-                            "dday_text": "진행중", "dday_class": "dday-safe", 
+                            "budget": "공고문 참조", 
+                            "close_date": close_date_disp, 
+                            "dday_text": dday_label, 
+                            "dday_class": dday_class, 
                             "url": bid.get('bidNtceDtlUrl') or bid.get('bidNtceUrl') or 'https://www.g2b.go.kr'
                         })
-        
-        # [안전장치] API 통신은 성공했으나, 타깃 키워드에 걸린 공고가 0건일 때
-        if api_success_count > 0 and len(items) == 0:
-            items.append({
-                "org": "API 정상가동", "category": "일반", "cat_class": "cat-general",
-                "title": "최근 14일 기준 '생산기술연구원' 등 타깃 조건에 맞는 신규 입찰이 없습니다.",
-                "tags": "#모니터링_가동중", "budget": "-", "close_date": "-", 
-                "dday_text": "대기", "dday_class": "dday-safe", "url": "#"
-            })
-            
     except Exception as e:
-        items.append({
-            "org": "🚨 API 에러", "category": "일반", "cat_class": "cat-general",
-            "title": f"통신 중 오류 발생: {str(e)[:80]}",
-            "tags": "#코드오류", "budget": "-", "close_date": "-", 
-            "dday_text": "오류", "dday_class": "dday-urgent", "url": "#"
-        })
+        pass
     return items
 
 def update_html():
