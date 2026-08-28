@@ -9,9 +9,8 @@ import json
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =====================================================================
-# 🔑 방금 테스트에 성공하신 '일반 인증키(Encoding)'를 아래에 꼭 넣어주세요!
-API_KEY_G2B = "yqd2J707PpMlQORvHoa0ZsjNNDqQM3Of%2BOmqs3p9kJXpkcwC2lc%2FzOR6R9MqPf6QyYyp0B0HnmjluOJh%2FBkzHA%3D%3D"
-API_KEY_IRIS = "yqd2J707PpMlQORvHoa0ZsjNNDqQM3Of%2BOmqs3p9kJXpkcwC2lc%2FzOR6R9MqPf6QyYyp0B0HnmjluOJh%2FBkzHA%3D%3D"
+API_KEY_G2B = "여기에_조달청_인코딩_키를_넣어주세요"
+API_KEY_IRIS = "여기에_IRIS_인코딩_키를_넣어주세요"
 # =====================================================================
 
 CATEGORY_RULES = {
@@ -87,18 +86,17 @@ def fetch_g2b_api():
     try:
         KST = timezone(timedelta(hours=9))
         now = datetime.now(KST)
-        # 검색 기간: 한 달 전 ~ 오늘
         bgn_dt = (now - timedelta(days=30)).strftime("%Y%m%d0000")
         end_dt = now.strftime("%Y%m%d2359")
         
-        url = f"http://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoServcPPSSrch01?serviceKey={API_KEY}&numOfRows=50&pageNo=1&inqryDiv=1&inqryBgnDt={bgn_dt}&inqryEndDt={end_dt}&type=json"
+        # 주의: 여기 변수가 API_KEY_G2B로 정확히 맵핑되어야 에러가 안 납니다.
+        url = f"http://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoServcPPSSrch01?serviceKey={API_KEY_G2B}&numOfRows=50&pageNo=1&inqryDiv=1&inqryBgnDt={bgn_dt}&inqryEndDt={end_dt}&type=json"
         
         res = requests.get(url, verify=False, timeout=15)
         if res.status_code == 200 and not res.text.startswith("<"):
             data = res.json()
             bids = data.get("response", {}).get("body", {}).get("items", [])
             
-            # 발주기관명(dminsttNm) 또는 공고명(bidNtceNm) 필터링
             target_orgs = ["생산기술연구원", "로봇산업진흥원", "국방기술품질원"]
             target_kws = ["컨베이어", "모듈", "검사장비", "자동화"]
             
@@ -106,7 +104,6 @@ def fetch_g2b_api():
                 org_name = bid.get('dminsttNm', '조달청')
                 title = bid.get('bidNtceNm', '')
                 
-                # 핵심 타깃 기관이거나 핵심 키워드가 포함된 공고만 선별
                 is_target_org = any(org in org_name for org in target_orgs)
                 is_target_kw = any(kw in title for kw in target_kws)
                 
@@ -132,7 +129,7 @@ def fetch_g2b_api():
                 
                 category, matched = classify_target(title)
                 items.append({
-                    "org": org_name[:12], # 기관명이 너무 길면 UI가 깨지므로 자름
+                    "org": org_name[:12],
                     "category": category if category != "일반" else "소부장",
                     "cat_class": "cat-cons" if category == "소부장" else "cat-rd",
                     "title": title,
@@ -144,12 +141,19 @@ def fetch_g2b_api():
                     "url": bid.get('ntceInsttDturl', 'https://www.g2b.go.kr')
                 })
     except Exception as e:
-        print(f"G2B API 연동 오류: {e}")
-    
+        print(f"G2B API 오류: {e}")
+    return items
+
+# ----------------- [API] IRIS 범부처 검색 (준비중 뼈대) -----------------
+def fetch_iris_api():
+    items = []
+    # 추후 IRIS API 공식 Endpoint URL과 파라미터 구조가 확인되면 이곳에 로직을 추가합니다.
+    # url = f"https://api.iris.go.kr/.../?serviceKey={API_KEY_IRIS}"
     return items
 
 def update_html():
-    bids = scrape_kimm() + fetch_g2b_api()
+    # 기계연 크롤링 + 조달청 API + IRIS API(틀) 통합 수집
+    bids = scrape_kimm() + fetch_g2b_api() + fetch_iris_api()
     
     with open("index.html", "r", encoding="utf-8") as f:
         html = f.read()
@@ -201,7 +205,6 @@ def update_html():
 
     with open("index.html", "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"하이브리드 동기화 완료: 총 {total_cnt}건")
 
 if __name__ == "__main__":
     update_html()
