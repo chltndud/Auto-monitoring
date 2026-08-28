@@ -9,7 +9,8 @@ import json
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # =====================================================================
-API_KEY_G2B = "여기에_조달청_인코딩_키를_넣어주세요"
+# 연구원님의 실제 API 인증키가 하드코딩되어 있습니다.
+API_KEY = "yqd2J707PpMlQORvHoa0ZsjNNDqQM3Of%2BOmqs3p9kJXpkcwC2lc%2FzOR6R9MqPf6QyYyp0B0HnmjluOJh%2FBkzHA%3D%3D"
 # =====================================================================
 
 CATEGORY_RULES = {
@@ -38,6 +39,7 @@ def scrape_kimm():
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get("https://www.kimm.re.kr/bidding", headers=headers, verify=False, timeout=10)
         soup = BeautifulSoup(res.text, 'html.parser')
+        
         for row in soup.find_all("tr"):
             cols = row.find_all("td")
             if len(cols) >= 7:
@@ -52,66 +54,94 @@ def scrape_kimm():
                 items.append({
                     "org": "한국기계연구원", "category": category,
                     "cat_class": "cat-cons", "title": title,
-                    "tags": "#출연연공고", "budget": "공고문 참조",
-                    "close_date": close_dt, "dday_text": "진행중",
-                    "dday_class": "dday-safe", "url": link
+                    "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#출연연공고", 
+                    "budget": "공고문 참조", "close_date": close_dt, 
+                    "dday_text": "진행중", "dday_class": "dday-safe", "url": link
                 })
-    except Exception as e:
+    except:
         pass
     return items
 
-# ----------------- [API] 조달청(G2B) -----------------
+# ----------------- [API] 조달청(G2B) 최신 규격 연동 -----------------
 def fetch_g2b_api():
     items = []
     try:
         KST = timezone(timedelta(hours=9))
         now = datetime.now(KST)
-        bgn_dt = (now - timedelta(days=7)).strftime("%Y%m%d0000")
+        # 검색 범위: 최근 14일
+        bgn_dt = (now - timedelta(days=14)).strftime("%Y%m%d0000")
         end_dt = now.strftime("%Y%m%d2359")
         
-        # 탐색 범위를 999건으로 대폭 확대
-        url = f"http://apis.data.go.kr/1230000/BidPublicInfoService04/getBidPblancListInfoServcPPSSrch01?serviceKey={API_KEY_G2B}&numOfRows=999&pageNo=1&inqryDiv=1&inqryBgnDt={bgn_dt}&inqryEndDt={end_dt}&type=json"
+        # 공식 문서 기준, 새롭게 개편된 물품 및 용역 오퍼레이션
+        endpoints = [
+            "getBidPblancListInfoThngPPSSrch",  # 물품 조회
+            "getBidPblancListInfoServcPPSSrch"  # 용역 조회
+        ]
         
-        res = requests.get(url, verify=False, timeout=20)
-        if res.status_code == 200 and not res.text.startswith("<"):
-            data = res.json()
-            bids = data.get("response", {}).get("body", {}).get("items", [])
+        # 타깃 필터링 (불필요한 쓰레기 공고 차단용)
+        target_orgs = ["생산기술연구원", "로봇산업진흥원", "국방기술품질원", "과학기술", "에너지기술연구원"]
+        target_kws = ["컨베이어", "모듈", "검사", "자동화", "장비", "제어", "로봇", "AI", "기구"]
+        
+        api_success_count = 0
+        
+        for ep in endpoints:
+            # 폐기된 구주소가 아닌 최신 ad/BidPublicInfoService 경로 적용
+            url = f"http://apis.data.go.kr/1230000/ad/BidPublicInfoService/{ep}?serviceKey={API_KEY}&numOfRows=500&pageNo=1&inqryDiv=1&inqryBgnDt={bgn_dt}&inqryEndDt={end_dt}&type=json"
             
-            target_orgs = ["생산기술연구원", "로봇산업진흥원", "국방기술품질원", "과학기술"]
-            target_kws = ["컨베이어", "모듈", "검사", "자동화", "장비", "제어"]
+            res = requests.get(url, verify=False, timeout=20)
             
-            for bid in bids:
-                org_name = bid.get('dminsttNm', '조달청')
-                title = bid.get('bidNtceNm', '')
+            # XML(에러)이 아닌 정상 JSON 데이터를 받았을 경우
+            if res.status_code == 200 and not res.text.strip().startswith("<"):
+                api_success_count += 1
+                data = res.json()
+                bids = data.get("response", {}).get("body", {}).get("items", [])
                 
-                is_target_org = any(org in org_name for org in target_orgs)
-                is_target_kw = any(kw in title for kw in target_kws)
-                
-                if is_target_org or is_target_kw:
-                    category, matched = classify_target(title)
-                    items.append({
-                        "org": org_name[:12], "category": category if category != "일반" else "소부장",
-                        "cat_class": "cat-rd", "title": title,
-                        "tags": "#조달청(매칭)", "budget": "공고문 참조",
-                        "close_date": bid.get('bidClseDt', '미정')[:8],
-                        "dday_text": "진행중", "dday_class": "dday-safe",
-                        "url": bid.get('ntceInsttDturl', 'https://www.g2b.go.kr')
-                    })
+                # 리스트 형태가 아닌 경우(dict) 리스트로 변환
+                if isinstance(bids, dict): 
+                    bids = [bids]
+                    
+                for bid in bids:
+                    org_name = bid.get('dminsttNm') or bid.get('ntceInsttNm') or '조달청'
+                    title = bid.get('bidNtceNm', '')
+                    
+                    is_target_org = any(org in org_name for org in target_orgs)
+                    is_target_kw = any(kw in title for kw in target_kws)
+                    
+                    # 기관명이나 제목에 키워드가 있는 경우만 수집
+                    if is_target_org or is_target_kw:
+                        category, matched = classify_target(title)
+                        
+                        # 날짜 포맷 예쁘게 다듬기
+                        close_dt_str = bid.get('bidClseDt', '미정')[:8]
+                        close_date_disp = f"{close_dt_str[:4]}-{close_dt_str[4:6]}-{close_dt_str[6:]}" if len(close_dt_str) == 8 else close_dt_str
+                        
+                        items.append({
+                            "org": org_name[:12], 
+                            "category": category if category != "일반" else "소부장",
+                            "cat_class": "cat-rd" if category == "AI" else "cat-cons", 
+                            "title": title,
+                            "tags": " ".join([f"#{k}" for k in matched[:3]]) if matched else "#조달청(매칭)", 
+                            "budget": "공고문 참조", "close_date": close_date_disp, 
+                            "dday_text": "진행중", "dday_class": "dday-safe", 
+                            "url": bid.get('bidNtceDtlUrl') or bid.get('bidNtceUrl') or 'https://www.g2b.go.kr'
+                        })
+        
+        # [안전장치] API 통신은 성공했으나, 타깃 키워드에 걸린 공고가 0건일 때
+        if api_success_count > 0 and len(items) == 0:
+            items.append({
+                "org": "API 정상가동", "category": "일반", "cat_class": "cat-general",
+                "title": "최근 14일 기준 '생산기술연구원' 등 타깃 조건에 맞는 신규 입찰이 없습니다.",
+                "tags": "#모니터링_가동중", "budget": "-", "close_date": "-", 
+                "dday_text": "대기", "dday_class": "dday-safe", "url": "#"
+            })
             
-            # [안전장치] 만약 필터링 후 조건에 맞는 게 0건이라면, 무조건 최신 2건을 집어넣어 API 통신 증명
-            if len(items) == 0 and len(bids) > 0:
-                for i in range(min(2, len(bids))):
-                    items.append({
-                        "org": bids[i].get('dminsttNm', '조달청')[:12],
-                        "category": "일반", "cat_class": "cat-general",
-                        "title": bids[i].get('bidNtceNm', ''),
-                        "tags": "#API통신_테스트_성공", "budget": "-",
-                        "close_date": bids[i].get('bidClseDt', '미정')[:8],
-                        "dday_text": "테스트", "dday_class": "dday-safe",
-                        "url": bids[i].get('ntceInsttDturl', 'https://www.g2b.go.kr')
-                    })
     except Exception as e:
-        print(f"API 에러: {e}")
+        items.append({
+            "org": "🚨 API 에러", "category": "일반", "cat_class": "cat-general",
+            "title": f"통신 중 오류 발생: {str(e)[:80]}",
+            "tags": "#코드오류", "budget": "-", "close_date": "-", 
+            "dday_text": "오류", "dday_class": "dday-urgent", "url": "#"
+        })
     return items
 
 def update_html():
@@ -123,8 +153,7 @@ def update_html():
     KST = timezone(timedelta(hours=9))
     now_str = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
     
-    # 시간 강제 치환 (형식이 깨져있어도 무조건 덮어쓰도록 정규식 완화)
-    html = re.sub(r'(<div[^>]*id="metaSync"[^>]*>).*?(</div>)', rf'\1<strong>최근 동기화:</strong> {now_str} (전면 재정비 가동)\2', html, flags=re.DOTALL)
+    html = re.sub(r'(<div[^>]*id="metaSync"[^>]*>).*?(</div>)', rf'\1<strong>최근 동기화:</strong> {now_str} (통합 API 정상화)\2', html, flags=re.DOTALL)
 
     if bids:
         rows_html = ""
@@ -134,11 +163,10 @@ def update_html():
           <td><span class="badge-org">{b['org']}</span></td>
           <td class="title-cell"><a href="{b['url']}" target="_blank">{b['title']}</a><br><small>{b['tags']}</small></td>
           <td><strong>{b['budget']}</strong></td>
-          <td><span class="{b['dday_class']}">{b['dday_text']}</span></td>
+          <td><span class="{b['dday_class']}">{b['dday_text']}</span><br><small style="color:#64748b;">{b['close_date']}</small></td>
           <td><a href="{b['url']}" target="_blank">공고문 ↗</a></td>
         </tr>"""
         
-        # <tbody> 치환
         html = re.sub(r'<tbody>.*?</tbody>', f'<tbody>\n{rows_html}\n      </tbody>', html, flags=re.DOTALL)
 
     with open("index.html", "w", encoding="utf-8") as f:
