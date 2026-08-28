@@ -4,7 +4,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # 1. GitHub Secrets를 쓰지 않고 키를 직접 코드에 박아버립니다 (가장 확실한 방법)
-TEST_KEY = yqd2J707PpMlQORvHoa0ZsjNNDqQM3Of%2BOmqs3p9kJXpkcwC2lc%2FzOR6R9MqPf6QyYyp0B0HnmjluOJh%2FBkzHA%3D%3D
+TEST_KEY = "yqd2J707PpMlQORvHoa0ZsjNNDqQM3Of%2BOmqs3p9kJXpkcwC2lc%2FzOR6R9MqPf6QyYyp0B0HnmjluOJh%2FBkzHA%3D%3D"
 
 # 2. 파이썬이 특수문자를 건드리지 못하도록 URL 전체를 통째로 조립합니다.
 # (최근 공고를 확인하기 위해 2026년 8월 데이터를 검색합니다)
